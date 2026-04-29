@@ -1,0 +1,5 @@
+# Output reports (may contain sensitive Azure resource details)
+model-inventory-*.csv
+
+# VS Code workspace settings
+.vscode/
