@@ -1,6 +1,6 @@
 # Get-AzModelInventory
 
-A PowerShell script that inventories all LLM model deployments across your Azure subscriptions and exports the results to a CSV report.
+A PowerShell script that inventories all LLM model deployments across your Azure subscriptions, enriches each deployment with **lifecycle and retirement data** from the Azure OpenAI Models API, and exports a color-coded report to CSV.
 
 ## Overview
 
@@ -9,7 +9,20 @@ This script scans all enabled Azure subscriptions accessible to the signed-in ac
 - **Azure OpenAI** (Cognitive Services) model deployments
 - **Azure Machine Learning** online endpoint model deployments
 
-### CSV columns
+For every Azure OpenAI deployment, the script calls the Azure OpenAI Models API to determine the model's current lifecycle status and published retirement date. Deployments are then classified into a **RetirementRisk** tier so you can immediately see which models need attention.
+
+## Retirement risk tiers
+
+| Console color | Risk tier | Meaning |
+|---|---|---|
+| 🔴 Red | `Retired` | Model is no longer listed by Azure — deployments will fail |
+| 🔴 Red | `Critical` | Retirement date is within **30 days** |
+| 🟡 Yellow | `High` | Retirement date is within **31–60 days** |
+| 🔵 Cyan | `Medium` | Retirement date is within **61–90 days** |
+| 🟢 Green | `Low` | Retirement date is more than **90 days** away |
+| ⚪ White | `None` | No retirement date published, or AML endpoint (no data) |
+
+## CSV columns
 
 | Column | Description |
 |---|---|
@@ -24,7 +37,11 @@ This script scans all enabled Azure subscriptions accessible to the signed-in ac
 | `SkuName` | SKU name (e.g. `Standard`, `GlobalStandard`) |
 | `Capacity` | Provisioned capacity (PTUs or TPM units) |
 | `UpgradePolicy` | Auto-upgrade policy for the deployment |
-| `ProvisionState` | Provisioning state (e.g. `Succeeded`, `Failed`) |
+| `ProvisionState` | Provisioning state (e.g. `Succeeded`, `Failed`, `Disabled`) |
+| `LifecycleStatus` | `GenerallyAvailable`, `Preview`, `Deprecated`, `Retired`, or `Unknown` |
+| `RetirementDate` | Published retirement date in `yyyy-MM-dd` format, or empty |
+| `DaysUntilRetirement` | Integer days until retirement; negative means already past the date |
+| `RetirementRisk` | `Retired`, `Critical`, `High`, `Medium`, `Low`, or `None` |
 | `ResourceId` | Full Azure resource ID |
 
 ## Prerequisites
@@ -68,7 +85,7 @@ Checking prerequisites...
 
 [1/4] Querying Azure OpenAI accounts via Resource Graph...
       Found 3 Azure OpenAI account(s).
-[2/4] Retrieving model deployments from each Azure OpenAI account...
+[2/4] Retrieving model deployments and lifecycle data from each Azure OpenAI account...
       Found 5 Azure OpenAI deployment(s).
 [3/4] Querying Azure ML online endpoints via Resource Graph...
       Found 0 AML online endpoint(s).
@@ -81,27 +98,55 @@ Checking prerequisites...
   Azure OpenAI deploys  : 5
   AML endpoint deploys  : 0
   Total deployments     : 5
-  Report saved to       : C:\Reports\model-inventory-20260325-150547.csv
+
+  Retirement Risk Summary:
+    [RETIRED ]  1 deployment(s) — model no longer available, immediate action required!
+    [CRITICAL]  1 deployment(s) — retiring within 30 days!
+    [HIGH    ]  1 deployment(s) — retiring within 31-60 days
+    [LOW     ]  2 deployment(s) — retiring in more than 90 days
+
+  Report saved to       : C:\Reports\model-inventory-20260429-090000.csv
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Risk       Source           ResourceGroup        AccountName            DeploymentName         ModelName              Version        RetirementDate Days    ProvisionState
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Retired    AzureOpenAI      rg-prod              oai-prod               gpt35-legacy           gpt-35-turbo           0301                          -120    Succeeded
+Critical   AzureOpenAI      rg-prod              oai-prod               gpt4-old               gpt-4                  0613           2026-05-15     17      Succeeded
+High       AzureOpenAI      rg-dev               oai-dev                gpt4o-mini-dev         gpt-4o-mini            2024-07-18     2026-06-10     43      Succeeded
+Low        AzureOpenAI      rg-prod              oai-prod               gpt4o-prod             gpt-4o                 2024-11-20     2026-09-30     155     Succeeded
+Low        AzureOpenAI      rg-prod              oai-prod               gpt41-prod             gpt-4.1                2025-04-14     2026-10-15     170     Succeeded
 ```
+
+## How retirement is detected
+
+The script calls the **Azure OpenAI Models API** (`GET .../models?api-version=2024-10-01`) once per Azure OpenAI account and caches the result. This API returns the `lifecycleStatus` and `deprecationDate` for every available model version in that account's region.
+
+| Scenario | Result |
+|---|---|
+| Model present in API with `deprecationDate` | `RetirementDate` and `DaysUntilRetirement` are populated; risk tier is calculated |
+| Model present in API, no `deprecationDate` | `LifecycleStatus` is `GenerallyAvailable` or `Preview`; risk is `None` |
+| Model **not present** in the API response | Treated as `Retired` — Azure removes retired models from the listing entirely |
+
+> **Note:** Microsoft publishes retirement dates in advance via the [Azure OpenAI model retirements documentation](https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/model-retirements). The `RetirementDate` column in the CSV is sourced directly from the ARM API and will be empty when Microsoft has not yet announced a date.
 
 ## Who is this for?
 
-- **Azure administrators / cloud ops teams** — audit what AI models are deployed across a large tenant
+- **Azure administrators / cloud ops teams** — audit what AI models are deployed across a large tenant and spot retirement risks immediately
 - **FinOps / cost teams** — identify all deployments and their capacity for cost tracking
-- **Security & compliance officers** — verify only approved models are deployed
-- **AI/ML platform teams** — build an inventory before model upgrades or retirements
-- **Microsoft CSAs and partners** — run assessments on behalf of customers
+- **Security & compliance officers** — verify only approved, non-retired models are deployed
+- **AI/ML platform teams** — plan model upgrades proactively before retirement deadlines
+- **Microsoft CSAs and partners** — run assessments on behalf of customers with a single command
 
 ## How it works
 
 1. **Prerequisites check** — validates Azure CLI login and auto-installs the `resource-graph` extension if needed
 2. **Subscription discovery** — enumerates all enabled subscriptions (or uses the list you provide)
 3. **Azure OpenAI accounts** — queries Azure Resource Graph for all Cognitive Services accounts of kind `OpenAI`
-4. **OpenAI deployments** — calls the ARM Deployments API (`2024-10-01`) for each account
-5. **AML online endpoints** — queries Azure Resource Graph for all `machinelearningservices/workspaces/onlineendpoints`
-6. **AML deployments** — calls the ARM Online Deployments API (`2024-04-01`) for each endpoint
-7. **Export** — writes a sorted CSV and prints a summary table to the console
+4. **OpenAI deployments + lifecycle** — calls the ARM Deployments API (`2024-10-01`) and the Models API (`2024-10-01`) per account; results are cached per account to minimise API calls
+5. **Retirement classification** — each deployment is assigned a `RetirementRisk` tier based on its retirement date relative to today
+6. **AML online endpoints** — queries Azure Resource Graph for all `machinelearningservices/workspaces/onlineendpoints`
+7. **AML deployments** — calls the ARM Online Deployments API (`2024-04-01`) for each endpoint
+8. **Export** — writes a sorted CSV with all columns and prints a color-coded, urgency-sorted table plus a risk summary banner to the console
 
 Both Resource Graph queries use automatic pagination (1 000 records per page) to handle large tenants reliably.
 
